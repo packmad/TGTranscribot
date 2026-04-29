@@ -1,0 +1,7 @@
+services:
+  tgtranscribot:
+    build:
+      context: .
+    env_file:
+      - .env
+    restart: unless-stopped
