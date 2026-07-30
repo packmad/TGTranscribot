@@ -24,6 +24,10 @@ def _default_out_path(audio_path: Path) -> Path:
     return audio_path.with_name(f"{audio_path.stem}_transcript.txt")
 
 
+def _progress(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Transcribe an audio file with OpenAI and print + save the transcript."
@@ -62,13 +66,16 @@ def main(argv: list[str] | None = None) -> int:
 
     client = OpenAI(api_key=api_key)
 
+    _progress(f"Preparing {audio_path} (model={model})")
     try:
         with tempfile.TemporaryDirectory(prefix="tgtranscribe_cli_") as td:
             td_path = Path(td)
             work_src = td_path / audio_path.name
             shutil.copy2(audio_path, work_src)
-            audio_path = _prepare_transcription_file(work_src)
-            transcript = (_openai_transcribe(client, audio_path, model) or "").strip()
+            audio_path = _prepare_transcription_file(work_src, on_progress=_progress)
+            transcript = (
+                _openai_transcribe(client, audio_path, model, on_progress=_progress) or ""
+            ).strip()
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

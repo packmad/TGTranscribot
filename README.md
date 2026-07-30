@@ -51,7 +51,7 @@ python transcribot.py
 
 ## Command-line transcription (local)
 
-Use `transcribe_cli.py` to transcribe a file on disk (prints the transcript to stdout and writes `<stem>_transcript.txt` next to the input unless you pass `-o`):
+Use `transcribe_cli.py` to transcribe a file on disk (prints the transcript to stdout and writes `<stem>_transcript.txt` next to the input unless you pass `-o`). Progress (compress tiers, segment i/N, etc.) goes to stderr so stdout stays pipe-friendly:
 
 ```bash
 set -a; source .env; set +a   # needs OPENAI_API_KEY; optional OPENAI_TRANSCRIBE_MODEL

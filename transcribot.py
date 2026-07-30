@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 import re
 import shutil
@@ -6,7 +7,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set
 
 from openai import OpenAI
 from telegram import Message, Update
@@ -94,7 +95,19 @@ def _ffmpeg_reencode_m4a_aac(
         raise RuntimeError(f"ffmpeg failed: {proc.stderr[-2000:]}")
 
 
-def _prepare_transcription_file(src: Path) -> Path:
+def _report_progress(on_progress: Optional[Callable[[str], None]], msg: str) -> None:
+    if on_progress is not None:
+        on_progress(msg)
+
+
+def _mb(nbytes: int) -> str:
+    return f"{nbytes / (1024 * 1024):.1f} MB"
+
+
+def _prepare_transcription_file(
+    src: Path,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> Path:
     """
     Produce audio under ~25 MB for the transcription API.
 
@@ -104,13 +117,41 @@ def _prepare_transcription_file(src: Path) -> Path:
     ext = src.suffix.lower().lstrip(".")
     api_ready = {"mp3", "m4a", "wav", "webm", "mp4", "mpeg", "mpga", "oga", "ogg", "opus", "flac", "aac"}
     if ext in api_ready and _size_ok(src, _MAX_TRANSCRIBE_BYTES):
+        try:
+            sz = src.stat().st_size
+        except OSError:
+            sz = 0
+        _report_progress(on_progress, f"Using original file ({_mb(sz)})")
         return src
 
+    limit_mb = _MAX_TRANSCRIBE_BYTES / (1024 * 1024)
     out = src.parent / f"{src.stem}_tgapi.m4a"
-    for bitrate_k, mono, sample_rate in _AAC_TIERS:
+    for i, (bitrate_k, mono, sample_rate) in enumerate(_AAC_TIERS):
+        extras: List[str] = []
+        if mono:
+            extras.append("mono")
+        if sample_rate is not None:
+            extras.append(f"{sample_rate // 1000}kHz")
+        detail = f" ({', '.join(extras)})" if extras else ""
+        _report_progress(on_progress, f"Compressing to AAC {bitrate_k} kbps{detail}…")
         _ffmpeg_reencode_m4a_aac(src, out, bitrate_k, mono=mono, sample_rate=sample_rate)
+        try:
+            sz = out.stat().st_size
+        except OSError:
+            sz = -1
         if _size_ok(out, _MAX_TRANSCRIBE_BYTES):
+            _report_progress(on_progress, f"→ {_mb(sz)} — OK")
             return out
+        if i + 1 < len(_AAC_TIERS):
+            _report_progress(
+                on_progress,
+                f"→ {_mb(sz)} (limit {limit_mb:.1f} MB), trying next tier",
+            )
+        else:
+            _report_progress(
+                on_progress,
+                f"→ {_mb(sz)} (limit {limit_mb:.1f} MB)",
+            )
 
     try:
         sz = out.stat().st_size
@@ -303,24 +344,48 @@ def _openai_transcribe_one(client: OpenAI, audio_path: Path, model: str) -> str:
     return getattr(tr, "text", "") or ""
 
 
-def _openai_transcribe(client: OpenAI, audio_path: Path, model: str) -> str:
+def _openai_transcribe(
+    client: OpenAI,
+    audio_path: Path,
+    model: str,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> str:
     max_chunk = _transcription_max_chunk_seconds(model)
     if max_chunk is None:
+        _report_progress(on_progress, f"Transcribing with {model}…")
         return _openai_transcribe_one(client, audio_path, model)
 
     try:
         total = _ffprobe_duration_seconds(audio_path)
     except Exception:
+        _report_progress(on_progress, f"Transcribing with {model} (duration unknown)…")
         return _openai_transcribe_one(client, audio_path, model)
 
     if total <= max_chunk:
+        _report_progress(
+            on_progress,
+            f"Duration {total:.0f}s; transcribing with {model}…",
+        )
         return _openai_transcribe_one(client, audio_path, model)
+
+    n_segments = max(1, math.ceil(total / float(max_chunk)))
+    _report_progress(
+        on_progress,
+        f"Duration {total:.0f}s; splitting into {n_segments} segments "
+        f"(max {max_chunk}s each)",
+    )
 
     parts: List[str] = []
     start = 0.0
     idx = 0
     while start < total - 1e-3:
         dur_seg = min(float(max_chunk), total - start)
+        end = start + dur_seg
+        _report_progress(
+            on_progress,
+            f"Transcribing segment {idx + 1}/{n_segments} "
+            f"({start:.0f}–{end:.0f}s)…",
+        )
         seg: Optional[Path] = audio_path.parent / f"{audio_path.stem}_seg{idx:04d}.m4a"
         try:
             _ffmpeg_extract_audio_segment(audio_path, seg, start, dur_seg)
