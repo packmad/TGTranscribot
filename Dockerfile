@@ -7,15 +7,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Upgrade pip before installing any Python dependencies.
-RUN python -m pip install --upgrade pip
-
 # ffmpeg also provides ffprobe, both required for audio normalization/chunking.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip only after the base system packages are in place.
+RUN python -m pip install --upgrade pip
 
 # Keep dependency installation in a separate cacheable layer.
 COPY requirements.txt ./
