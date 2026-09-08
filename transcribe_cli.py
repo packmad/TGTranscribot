@@ -2,8 +2,8 @@
 """
 Command-line transcription: print transcript to stdout and save to a text file.
 
-Requires OPENAI_API_KEY. Optional OPENAI_TRANSCRIBE_MODEL (default: gpt-4o-transcribe).
-Requires ffmpeg on PATH (same as the Telegram bot).
+Requires OPENAI_API_KEY. Optional OPENAI_TRANSCRIBE_MODEL (default: gpt-transcribe).
+Requires ffmpeg/ffprobe on PATH (same as the Telegram bot).
 """
 
 from __future__ import annotations
@@ -17,7 +17,11 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from transcribot import _openai_transcribe, _prepare_transcription_file
+from transcribot import (
+    _DEFAULT_TRANSCRIBE_MODEL,
+    _openai_transcribe,
+    _prepare_transcription_file,
+)
 
 
 def _default_out_path(audio_path: Path) -> Path:
@@ -47,7 +51,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--model",
         default=None,
-        help="OpenAI transcription model (default: env OPENAI_TRANSCRIBE_MODEL or gpt-4o-transcribe).",
+        help=(
+            "OpenAI transcription model "
+            f"(default: env OPENAI_TRANSCRIBE_MODEL or {_DEFAULT_TRANSCRIBE_MODEL})."
+        ),
     )
     args = p.parse_args(argv)
 
@@ -61,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         print("error: OPENAI_API_KEY is not set", file=sys.stderr)
         return 1
 
-    model = args.model or os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+    model = args.model or os.getenv("OPENAI_TRANSCRIBE_MODEL", _DEFAULT_TRANSCRIBE_MODEL)
     out_path = args.output.expanduser().resolve() if args.output else _default_out_path(audio_path)
 
     client = OpenAI(api_key=api_key)
