@@ -1,22 +1,30 @@
-FROM python:3-slim-trixie
+FROM python:3.14-slim-trixie
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-RUN useradd -m -u 10001 appuser
+# Upgrade pip before installing any Python dependencies.
+RUN python -m pip install --upgrade pip
 
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# ffmpeg also provides ffprobe, both required for audio normalization/chunking.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# Keep dependency installation in a separate cacheable layer.
+COPY requirements.txt ./
+RUN python -m pip install -r requirements.txt
 
-COPY . /app
+# Run the bot as an unprivileged user with no login shell.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser
+
+COPY --chown=appuser:appuser transcribot.py ./
 
 USER appuser
 
