@@ -21,6 +21,39 @@ from telegram.ext import (
 )
 
 
+_DEFAULT_TRANSCRIBE_MODEL = "gpt-transcribe"
+# The Transcriptions API accepts uploads up to 25 MB. Keep the threshold in
+# decimal bytes, matching the documented MB unit rather than MiB.
+_MAX_TRANSCRIBE_BYTES = 25_000_000
+# Oversized files are locally split into AAC/M4A segments at 64 kbps mono.
+# 2400 s ~= 19.2 MB of encoded audio, leaving comfortable container overhead.
+_CHUNK_AAC_BITRATE_K = 64
+_SAFE_CHUNK_SECONDS = 2400
+
+# Formats documented by the current OpenAI Transcriptions API. Other formats
+# are normalized to AAC-in-M4A with ffmpeg before upload.
+_API_AUDIO_EXTENSIONS = {
+    "flac",
+    "mp3",
+    "mp4",
+    "mpeg",
+    "mpga",
+    "m4a",
+    "ogg",
+    "wav",
+    "webm",
+}
+
+# AAC bitrate (kbps), mono, optional sample rate (Hz). We stop at 64 kbps;
+# files still above the API size limit are chunked instead of being crushed to
+# very low bitrates just to fit in a single request.
+_AAC_TIERS: List[tuple[int, bool, Optional[int]]] = [
+    (128, False, None),
+    (96, False, None),
+    (64, True, None),
+]
+
+
 def _safe_username(u: Optional[str]) -> str:
     return (u or "").strip().lstrip("@").lower()
 
@@ -50,17 +83,20 @@ def _require_ffprobe() -> None:
         raise RuntimeError("ffprobe not found in PATH. Please install ffmpeg (includes ffprobe).")
 
 
-_MAX_TRANSCRIBE_BYTES = 25 * 1024 * 1024
+def _report_progress(on_progress: Optional[Callable[[str], None]], msg: str) -> None:
+    if on_progress is not None:
+        on_progress(msg)
 
-# AAC bitrate (kbps), mono, optional sample rate (Hz) — OpenAI accepts m4a; some gpt-4o-transcribe
-# deployments reject certain FFmpeg MP3 streams, so we standardize on AAC-in-M4A here.
-_AAC_TIERS: List[tuple[int, bool, Optional[int]]] = [
-    (128, False, None),
-    (96, False, None),
-    (64, False, None),
-    (48, True, None),
-    (32, True, 16000),
-]
+
+def _mb(nbytes: int) -> str:
+    return f"{nbytes / 1_000_000:.1f} MB"
+
+
+def _size_ok(path: Path, max_bytes: int = _MAX_TRANSCRIBE_BYTES) -> bool:
+    try:
+        return path.stat().st_size <= max_bytes
+    except FileNotFoundError:
+        return False
 
 
 def _ffmpeg_reencode_m4a_aac(
@@ -95,36 +131,34 @@ def _ffmpeg_reencode_m4a_aac(
         raise RuntimeError(f"ffmpeg failed: {proc.stderr[-2000:]}")
 
 
-def _report_progress(on_progress: Optional[Callable[[str], None]], msg: str) -> None:
-    if on_progress is not None:
-        on_progress(msg)
-
-
-def _mb(nbytes: int) -> str:
-    return f"{nbytes / (1024 * 1024):.1f} MB"
-
-
 def _prepare_transcription_file(
     src: Path,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """
-    Produce audio under ~25 MB for the transcription API.
+    Normalize audio for the OpenAI Transcriptions API.
 
-    If the file is already small enough and in a common API format, returns it unchanged.
-    Otherwise re-encodes to AAC in an .m4a container (bitrate ladder on the original source).
+    Supported files are kept unchanged. Unsupported containers/codecs are
+    converted to AAC/M4A. Files larger than the API's 25 MB per-request limit
+    are intentionally left larger than the limit; _openai_transcribe() splits
+    them into upload-safe chunks instead of degrading them to very low bitrate.
     """
     ext = src.suffix.lower().lstrip(".")
-    api_ready = {"mp3", "m4a", "wav", "webm", "mp4", "mpeg", "mpga", "oga", "ogg", "opus", "flac", "aac"}
-    if ext in api_ready and _size_ok(src, _MAX_TRANSCRIBE_BYTES):
-        try:
-            sz = src.stat().st_size
-        except OSError:
-            sz = 0
-        _report_progress(on_progress, f"Using original file ({_mb(sz)})")
+    try:
+        src_size = src.stat().st_size
+    except OSError:
+        src_size = 0
+
+    if ext in _API_AUDIO_EXTENSIONS:
+        if src_size <= _MAX_TRANSCRIBE_BYTES:
+            _report_progress(on_progress, f"Using original file ({_mb(src_size)})")
+        else:
+            _report_progress(
+                on_progress,
+                f"Original file is {_mb(src_size)}; it will be split into upload-safe chunks",
+            )
         return src
 
-    limit_mb = _MAX_TRANSCRIBE_BYTES / (1024 * 1024)
     out = src.parent / f"{src.stem}_tgapi.m4a"
     for i, (bitrate_k, mono, sample_rate) in enumerate(_AAC_TIERS):
         extras: List[str] = []
@@ -133,45 +167,32 @@ def _prepare_transcription_file(
         if sample_rate is not None:
             extras.append(f"{sample_rate // 1000}kHz")
         detail = f" ({', '.join(extras)})" if extras else ""
-        _report_progress(on_progress, f"Compressing to AAC {bitrate_k} kbps{detail}…")
+        _report_progress(on_progress, f"Converting to AAC {bitrate_k} kbps{detail}…")
         _ffmpeg_reencode_m4a_aac(src, out, bitrate_k, mono=mono, sample_rate=sample_rate)
         try:
             sz = out.stat().st_size
         except OSError:
             sz = -1
-        if _size_ok(out, _MAX_TRANSCRIBE_BYTES):
+
+        if _size_ok(out):
             _report_progress(on_progress, f"→ {_mb(sz)} — OK")
             return out
+
         if i + 1 < len(_AAC_TIERS):
             _report_progress(
                 on_progress,
-                f"→ {_mb(sz)} (limit {limit_mb:.1f} MB), trying next tier",
-            )
-        else:
-            _report_progress(
-                on_progress,
-                f"→ {_mb(sz)} (limit {limit_mb:.1f} MB)",
+                f"→ {_mb(sz)} (25 MB/request limit), trying next tier",
             )
 
-    try:
-        sz = out.stat().st_size
-    except OSError:
-        sz = -1
-    raise RuntimeError(
-        "Audio is still larger than 25 MB after maximum compression (~32 kbps AAC mono, 16 kHz). "
-        f"Current size about {sz / (1024 * 1024):.1f} MB. Split into shorter segments or use a lower-quality source."
+    _report_progress(
+        on_progress,
+        f"→ {_mb(out.stat().st_size)}; will split into upload-safe chunks",
     )
+    return out
 
 
 # Backwards-compatible name (CLI / external scripts).
 _maybe_convert_to_mp3 = _prepare_transcription_file
-
-
-def _size_ok(path: Path, max_bytes: int = 25 * 1024 * 1024) -> bool:
-    try:
-        return path.stat().st_size <= max_bytes
-    except FileNotFoundError:
-        return False
 
 
 def _user_error_detail(exc: BaseException, max_len: int = 3200) -> str:
@@ -183,9 +204,7 @@ def _user_error_detail(exc: BaseException, max_len: int = 3200) -> str:
 
 
 def _chunk_text_for_telegram(text: str, max_len: int = 3900) -> List[str]:
-    """
-    Telegram message limit is ~4096 chars. Use a conservative chunk size and try to split on newlines.
-    """
+    """Split text conservatively under Telegram's ~4096-character message limit."""
     s = (text or "").strip()
     if not s:
         return []
@@ -250,7 +269,7 @@ async def _send_transcript_txt(update: Update, transcript: str) -> None:
 
 
 async def _reply_transcript_in_chat_chunks(message: Message, transcript: str) -> None:
-    """Send transcript as one or more Telegram messages; warn and label parts when splitting."""
+    """Send transcript as one or more Telegram messages."""
     chunks = _chunk_text_for_telegram(transcript)
     if not chunks:
         return
@@ -261,28 +280,30 @@ async def _reply_transcript_in_chat_chunks(message: Message, transcript: str) ->
             f"(Telegram allows about 4096 characters per message). Total parts: {total}."
         )
     for i, part in enumerate(chunks, start=1):
-        if total > 1:
-            body = f"Part {i} of {total}\n\n{part}"
-        else:
-            body = part
+        body = f"Part {i} of {total}\n\n{part}" if total > 1 else part
         await message.reply_text(body)
 
 
-def _transcription_max_chunk_seconds(model: str) -> Optional[int]:
+def _transcription_chunk_seconds() -> int:
     """
-    Max seconds per upload for models with a duration cap (e.g. gpt-4o-transcribe ~1400s).
-    None = do not split by duration (e.g. whisper-1).
-    Override with OPENAI_TRANSCRIBE_MAX_SECONDS (integer, min 60).
+    Duration for local upload-size chunks.
+
+    The current API limit is byte-based (25 MB/request), not the old
+    gpt-4o-transcribe ~1400-second cap. Segments are re-encoded at 64 kbps mono,
+    so 2400 seconds is about 19.2 MB plus small M4A overhead.
+
+    OPENAI_TRANSCRIBE_CHUNK_SECONDS can request a smaller chunk. The legacy
+    OPENAI_TRANSCRIBE_MAX_SECONDS variable is accepted as a fallback for
+    backwards compatibility. Values are clamped to the safe 60..2400 range.
     """
-    ml = model.lower()
-    if "whisper" in ml:
-        return None
-    if "gpt-4o" in ml and "transcribe" in ml:
-        raw = (os.getenv("OPENAI_TRANSCRIBE_MAX_SECONDS") or "").strip()
-        if raw.isdigit():
-            return max(60, int(raw))
-        return 1350
-    return None
+    raw = (
+        os.getenv("OPENAI_TRANSCRIBE_CHUNK_SECONDS")
+        or os.getenv("OPENAI_TRANSCRIBE_MAX_SECONDS")
+        or ""
+    ).strip()
+    if raw.isdigit():
+        return min(_SAFE_CHUNK_SECONDS, max(60, int(raw)))
+    return _SAFE_CHUNK_SECONDS
 
 
 def _ffprobe_duration_seconds(path: Path) -> float:
@@ -303,12 +324,16 @@ def _ffprobe_duration_seconds(path: Path) -> float:
     out = proc.stdout.strip()
     if not out:
         raise RuntimeError("ffprobe returned no duration")
-    first = out.splitlines()[0].strip()
-    return float(first)
+    return float(out.splitlines()[0].strip())
 
 
-def _ffmpeg_extract_audio_segment(src: Path, dst: Path, start_sec: float, duration_sec: float) -> None:
-    """Extract [start_sec, start_sec+duration) to a fresh AAC/M4A file (clean timestamps for the API)."""
+def _ffmpeg_extract_audio_segment(
+    src: Path,
+    dst: Path,
+    start_sec: float,
+    duration_sec: float,
+) -> None:
+    """Extract one upload-safe AAC/M4A audio segment with clean timestamps."""
     _require_ffmpeg()
     cmd = [
         "ffmpeg",
@@ -323,7 +348,7 @@ def _ffmpeg_extract_audio_segment(src: Path, dst: Path, start_sec: float, durati
         "-c:a",
         "aac",
         "-b:a",
-        "64k",
+        f"{_CHUNK_AAC_BITRATE_K}k",
         "-ac",
         "1",
         "-movflags",
@@ -337,10 +362,15 @@ def _ffmpeg_extract_audio_segment(src: Path, dst: Path, start_sec: float, durati
 
 def _openai_transcribe_one(client: OpenAI, audio_path: Path, model: str) -> str:
     with audio_path.open("rb") as f:
-        tr = client.audio.transcriptions.create(
-            model=model,
-            file=(audio_path.name, f),
-        )
+        kwargs = {
+            "model": model,
+            "file": (audio_path.name, f),
+        }
+        # gpt-transcribe supports server-side automatic VAD chunking. This is
+        # independent of the 25 MB HTTP upload limit handled locally below.
+        if model.lower() == "gpt-transcribe":
+            kwargs["chunking_strategy"] = "auto"
+        tr = client.audio.transcriptions.create(**kwargs)
     return getattr(tr, "text", "") or ""
 
 
@@ -350,36 +380,39 @@ def _openai_transcribe(
     model: str,
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> str:
-    max_chunk = _transcription_max_chunk_seconds(model)
-    if max_chunk is None:
-        _report_progress(on_progress, f"Transcribing with {model}…")
+    try:
+        file_size = audio_path.stat().st_size
+    except OSError as e:
+        raise RuntimeError(f"cannot stat audio file: {e}") from e
+
+    if file_size <= _MAX_TRANSCRIBE_BYTES:
+        _report_progress(
+            on_progress,
+            f"Transcribing {_mb(file_size)} with {model}…",
+        )
         return _openai_transcribe_one(client, audio_path, model)
 
     try:
         total = _ffprobe_duration_seconds(audio_path)
-    except Exception:
-        _report_progress(on_progress, f"Transcribing with {model} (duration unknown)…")
-        return _openai_transcribe_one(client, audio_path, model)
+    except Exception as e:
+        raise RuntimeError(
+            "Audio exceeds the 25 MB transcription upload limit and its duration "
+            f"could not be determined for local chunking: {e}"
+        ) from e
 
-    if total <= max_chunk:
-        _report_progress(
-            on_progress,
-            f"Duration {total:.0f}s; transcribing with {model}…",
-        )
-        return _openai_transcribe_one(client, audio_path, model)
-
-    n_segments = max(1, math.ceil(total / float(max_chunk)))
+    chunk_seconds = _transcription_chunk_seconds()
+    n_segments = max(1, math.ceil(total / float(chunk_seconds)))
     _report_progress(
         on_progress,
-        f"Duration {total:.0f}s; splitting into {n_segments} segments "
-        f"(max {max_chunk}s each)",
+        f"Input is {_mb(file_size)}; splitting into {n_segments} upload-safe segments "
+        f"(up to {chunk_seconds}s each)",
     )
 
     parts: List[str] = []
     start = 0.0
     idx = 0
     while start < total - 1e-3:
-        dur_seg = min(float(max_chunk), total - start)
+        dur_seg = min(float(chunk_seconds), total - start)
         end = start + dur_seg
         _report_progress(
             on_progress,
@@ -393,7 +426,8 @@ def _openai_transcribe(
                 raise RuntimeError(f"empty segment file for chunk {idx + 1}")
             if not _size_ok(seg):
                 raise RuntimeError(
-                    f"Segment {idx + 1} exceeds 25 MB; shorten OPENAI_TRANSCRIBE_MAX_SECONDS or use lower bitrate."
+                    f"Segment {idx + 1} is {_mb(seg.stat().st_size)}, above the 25 MB API limit. "
+                    "Set OPENAI_TRANSCRIBE_CHUNK_SECONDS to a smaller value."
                 )
             parts.append(_openai_transcribe_one(client, seg, model).strip())
         finally:
@@ -437,7 +471,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             td_path = Path(td)
             try:
                 tg_file = await context.bot.get_file(audio.file_id)
-                src_path = td_path / (getattr(audio, "file_name", None) or f"audio_{audio.file_id}.bin")
+                src_path = td_path / (
+                    getattr(audio, "file_name", None) or f"audio_{audio.file_id}.bin"
+                )
                 await tg_file.download_to_drive(custom_path=str(src_path))
             except Exception as e:
                 detail = _user_error_detail(e)
@@ -445,29 +481,29 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 low = detail.lower()
                 if "too big" in low or "too_large" in low or "file is too" in low:
                     lines.append(
-                        "Note: On the default Telegram Bot API, bots can only download files up to "
-                        "about 20 MB. Our transcription limit after conversion is 25 MB. "
-                        "Very large files fail at download before that check."
+                        "Note: the default Telegram Bot API may reject large bot downloads "
+                        "before TGTranscribot can locally split them for OpenAI."
                     )
                 await msg.reply_text("\n".join(lines))
                 return
 
             try:
-                audio_path = await asyncio.to_thread(_prepare_transcription_file, src_path)
+                audio_path = await asyncio.to_thread(
+                    _prepare_transcription_file,
+                    src_path,
+                )
             except Exception as e:
                 await msg.reply_text(f"Failed to convert audio: {_user_error_detail(e)}")
                 return
 
-            if not _size_ok(audio_path):
-                await msg.reply_text(
-                    "The converted audio is still larger than 25 MB, so it cannot be transcribed. "
-                    "Try a shorter recording or a more compressed format."
-                )
-                return
-
             await msg.chat.send_action(action=ChatAction.TYPING)
             try:
-                transcript = await asyncio.to_thread(_openai_transcribe, openai_client, audio_path, openai_model)
+                transcript = await asyncio.to_thread(
+                    _openai_transcribe,
+                    openai_client,
+                    audio_path,
+                    openai_model,
+                )
             except Exception as e:
                 await msg.reply_text(f"Transcription failed: {_user_error_detail(e)}")
                 return
@@ -480,7 +516,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             await _send_transcript_txt(update, transcript)
         except Exception as e:
-            await msg.reply_text(f"Transcript was sent in chat, but uploading the .txt file failed: {_user_error_detail(e)}")
+            await msg.reply_text(
+                "Transcript was sent in chat, but uploading the .txt file failed: "
+                f"{_user_error_detail(e)}"
+            )
     except Exception as e:
         await msg.reply_text(f"Something went wrong: {_user_error_detail(e)}")
     finally:
@@ -498,7 +537,7 @@ def build_app() -> Application:
         raise RuntimeError("ALLOWED_USERNAMES is empty.")
 
     openai_key = _env_required("OPENAI_API_KEY")
-    openai_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+    openai_model = os.getenv("OPENAI_TRANSCRIBE_MODEL", _DEFAULT_TRANSCRIBE_MODEL)
     client = OpenAI(api_key=openai_key)
 
     app = Application.builder().token(token).build()
@@ -508,7 +547,9 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("start", cmd_start))
     # Accept audio, voice notes, and audio sent as "documents".
-    app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.AUDIO, handle_audio))
+    app.add_handler(
+        MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.AUDIO, handle_audio)
+    )
     app.add_error_handler(on_bot_error)
     return app
 
